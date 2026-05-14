@@ -1,0 +1,38 @@
+networks:
+  agent-net:
+    driver: bridge
+  proxy-net:
+    driver: bridge
+
+services:
+  proxy:
+    build: ./proxy
+    networks:
+      - agent-net
+      - proxy-net
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
+      interval: 5s
+      retries: 10
+
+  stub-target:
+    build: ./stub-target
+    networks:
+      - agent-net
+      - proxy-net
+
+  orchestrator:
+    build: ./agents/orchestrator
+    networks:
+      - agent-net
+    environment:
+      - TARGET_URL=http://stub-target
+
+  worker:
+    build: ./agents/worker
+    networks:
+      - agent-net
+    environment:
+      - TARGET_URL=http://stub-target
