@@ -9,8 +9,8 @@ Multi-agent AI systems (OpenClaw, LangGraph, AutoGen, CrewAI, etc.) suffer from 
 This system closes that gap by placing an authorization proxy between agents and everything they can reach:
 
 - All outbound agent traffic is intercepted by an iptables redirect rule and routed through the proxy regardless of framework
-- The proxy will verify Macaroon delegation tokens and evaluate Cedar policies on every request
-- [Tetragon](https://tetragon.io) monitors all process execution inside containers at the eBPF level, providing a tamper-proof audit trail and kernel-level enforcement
+- The proxy evaluates a Cedar policy on every request and injects a Macaroon delegation token on allow, or returns 403 on deny
+- [Tetragon](https://tetragon.io) monitors all process execution inside containers at the eBPF level, supplying each agent's identity to the proxy and providing a kernel-level audit trail
 
 The agent framework is never modified. Any HTTP-speaking agent works without configuration changes.
 
@@ -18,16 +18,31 @@ The agent framework is never modified. Any HTTP-speaking agent works without con
 
 ```
 .
-├── proxy/               FastAPI authorization proxy
-│   └── src/main.py      HTTP middleware + passthrough (auth logic added next)
-├── listener/            Go binary subscribing to Tetragon's gRPC event stream
-│   └── main.go          Receives process exec events, will bootstrap agent credentials
+├── cmd/
+│   ├── proxy/           authorization proxy (Go): intercept, enforce, forward
+│   │   ├── main.go      server wiring and routes
+│   │   ├── proxy.go     identify + permit (the macaroon ∩ policy intersection)
+│   │   ├── forward.go   relays the request, attaches the credential
+│   │   ├── http.go      health + /api/bootstrap handlers
+│   │   ├── store.go     source IP → agent identity map
+│   │   ├── config.go    key + policy-file configuration
+│   │   └── Dockerfile   multi-stage build of the proxy image
+│   └── listener/        Tetragon gRPC subscriber
+│       ├── main.go      receives exec events, bootstraps each container
+│       ├── identity.go  identity struct + container store
+│       ├── docker.go    resolves a container's agent-net IP and role
+│       ├── bootstrap.go POSTs identity to the proxy
+│       └── token.go     mints the container's root macaroon
+├── internal/
+│   ├── macaroon/        mint · attenuate · serialize · verify
+│   └── policy/          Cedar evaluation (cedar-go)
 ├── agents/
 │   ├── orchestrator/    Stub orchestrator agent (demonstrates normal + injected calls)
 │   └── worker/          Stub worker agent (the confused deputy victim)
-├── stub-target/         Simple echo server (stands in for an external API)
-├── policies/            Tetragon TracingPolicy YAMLs
-│   └── exec-monitor.yaml  Logs all execve syscalls across containers
+├── stub-target/         Simple echo server (echoes path + received headers)
+├── policies/
+│   ├── agents.cedar     authorization policy the proxy enforces
+│   └── exec-monitor.yaml  Tetragon TracingPolicy: logs all execve syscalls
 ├── scripts/
 │   ├── start.sh         Start Tetragon, load policies, bring up containers
 │   └── stop.sh          Tear everything down
@@ -41,22 +56,16 @@ The agent framework is never modified. Any HTTP-speaking agent works without con
 | Dependency | Version | Notes |
 |---|---|---|
 | Docker | 29+ | `docker compose` v2 plugin required |
-| Go | 1.25+ | For building the listener |
-| Python | 3.12+ | Used inside containers via uv |
+| Go | 1.25+ | For building the proxy and listener |
 | Tetragon | 1.6+ | Must be installed on the host |
+
+The proxy is built in Docker, so Go is only needed on the host to build the listener (which talks to the Tetragon socket).
 
 ### Install Go
 
 ```bash
-curl -fsSL https://go.dev/dl/go1.24.3.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
+curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
-```
-
-### Install uv (Python package manager)
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.local/bin/env
 ```
 
 ### Install Tetragon
@@ -86,7 +95,7 @@ docker compose logs -f proxy
 
 **Terminal 2 — watch Tetragon process events:**
 ```bash
-cd listener && go build -o listener . && sudo ./listener
+go build -o listener ./cmd/listener && sudo ./listener
 ```
 
 **Terminal 3 — trigger the attack:**
@@ -96,13 +105,15 @@ docker compose run --rm orchestrator
 
 Expected output in terminal 3:
 ```
-GET /hello -> 200: {"ok": true, "path": "/hello"}
-injected task -> 200: {"url":"http://stub-target/admin/secret-data", ...}
+GET /hello -> 200: {"ok": true, "path": "/hello", "headers": {... "x-macaroon": "<base64 macaroon>", "x-agent-principal": "orchestrator"}}
+injected task -> 200: {"url":"http://stub-target/admin/secret-data", "status": 403, "body": "{\"error\":\"forbidden\",\"principal\":\"worker\",...}"}
 ```
 
-The second line is the confused deputy — the orchestrator injected a task that caused the worker to call `/admin/secret-data`. Both succeed because the proxy is currently a passthrough. Once Macaroon + Cedar are wired in, the second call will return 403.
+The first line is a legitimate call: Cedar permits `orchestrator → GET /hello`, so the proxy injects a Macaroon header and forwards it. You can see the injected `x-macaroon` and `x-agent-principal` headers echoed back by the stub target — that is Go-supplied identity reaching the request.
 
-Terminal 2 shows an `[exec]` line for every process that spawns inside any container, attributed by Docker container ID. This is the Tetragon event stream that will drive automatic credential bootstrap.
+The second line is the confused deputy. The orchestrator's `POST /task` to the worker is permitted (the delegation itself is legitimate), so the worker receives it and tries to fetch `/admin/secret-data`. That downstream call has principal `worker`, which Cedar forbids — so the proxy returns **403 and never forwards it to the stub target**. The worker reports that inner `status: 403` back to the orchestrator. The attack is blocked by policy, at the exact hop where authorization is exceeded — not by network reachability.
+
+Terminal 2 shows an `[exec]` line for every process that spawns inside any container. On the first exec per container the listener resolves that container's IP and role and POSTs it to the proxy's `/api/bootstrap`, which is how the proxy knows who each source IP is.
 
 ## Verifying Enforcement
 
@@ -146,7 +157,7 @@ sudo tetra getevents -o compact
 
 **Build and run the Go listener:**
 ```bash
-cd listener && go build -o listener . && sudo ./listener
+go build -o listener ./cmd/listener && sudo ./listener
 ```
 
 **Tear everything down:**
@@ -160,7 +171,12 @@ Copy `.env.example` to `.env` and set values as needed.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TETRAGON_SOCK` | `unix:///var/run/tetragon/tetragon.sock` | Tetragon gRPC socket path |
+| `TETRAGON_SOCK` | `unix:///var/run/tetragon/tetragon.sock` | Tetragon gRPC socket path (listener) |
+| `MACAROON_KEY` | `dev-insecure-key` | HMAC root key for minting/verifying macaroons; must match between listener and proxy |
+| `POLICY_FILE` | `policies/agents.cedar` | Cedar policy the proxy enforces |
+| `PROXY_URL` | `http://localhost:8080` | where the listener posts bootstrap identities |
+
+The defaults work out of the box: the listener and proxy share the same default `MACAROON_KEY`, so minted tokens verify without any setup.
 
 ## How the Network Isolation Works
 
@@ -181,12 +197,19 @@ An iptables DNAT rule on the `agent-net` bridge interface redirects all TCP traf
 
 ## Current Status
 
-This is the MVP scaffolding. The following components are stubbed and will be implemented next:
+Working end to end (all Go):
 
-- **Macaroon token issuance and verification** — attenuated delegation tokens so sub-agents cannot exceed their originating scope
-- **Cedar policy evaluation** — declarative per-role, per-action authorization rules
-- **Credential bootstrap** — the Go listener will call `POST /api/bootstrap` when Tetragon detects a new agent container, automatically issuing credentials derived from the parent agent's token
-- **Delegation chain logging** — full `parent → child` audit trail exposed via `GET /api/audit`
+- **Credential bootstrap** — the listener calls `POST /api/bootstrap` when Tetragon detects a new container, supplying its IP, role, and a freshly minted root macaroon
+- **Real Macaroons** — `internal/macaroon` mints, attenuates, serializes, and verifies tokens; attenuation provably only narrows authority
+- **Cedar policy** — `internal/policy` (cedar-go) evaluates `policies/agents.cedar` per request
+- **Intersection enforcement** — the proxy permits a request only if the macaroon verifies *and* the local Cedar policy allows; deny returns 403, unknown sources fail closed
+- **Header injection** — on allow, the proxy attaches `x-macaroon` and `x-agent-principal` before forwarding
+
+Next:
+
+- **Caveat-carried authority** — encode allowed operations as macaroon caveats so authority travels in the token itself (currently the token binds identity and Cedar carries the operation policy)
+- **Parent → child attenuation** — Tetragon reports each process's parent and ancestors; mint child tokens as a strict subset of the parent's and expose a `parent → child` audit trail via `GET /api/audit`
+- **Per-principal service instances** — have the ingress side spawn a per-caller container bound to the attenuated macaroon, so concurrent callers of the same service are isolated
 
 ## Research Context
 

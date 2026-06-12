@@ -6,14 +6,16 @@ networks:
 
 services:
   proxy:
-    build: ./proxy
+    build:
+      context: .
+      dockerfile: cmd/proxy/Dockerfile
     networks:
       - agent-net
       - proxy-net
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
       interval: 5s
       retries: 10
 

@@ -4,7 +4,9 @@ import json
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({"ok": True, "path": self.path}).encode()
+        body = json.dumps(
+            {"ok": True, "path": self.path, "headers": dict(self.headers)}
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
